@@ -1,8 +1,8 @@
 const express = require('express');
 const multer = require('multer');
 const pdfService = require('../services/pdfService');
-const aiService = require('../services/aiService');
 const n8nService = require('../services/n8nService');
+const { queuedExtractStructuredJSON } = require('../lib/queue'); 
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -17,10 +17,10 @@ router.post('/process', upload.single('file'), async (req, res) => {
     // Extract text from PDF
     const text = await pdfService.extractTextFromBuffer(file);
 
-    // Build structured JSON using AI
-    const structuredJson = await aiService.extractStructuredJSON({ text, question });
+    // Build structured JSON using AI (queued to avoid 429s)
+    const structuredJson = await queuedExtractStructuredJSON({ text, question });
 
-    // Send event to n8n (forward all processing metadata)xx
+    // Send event to n8n (forward all processing metadata)
     await n8nService.sendToN8N({
        filename: file.originalname,
        fileSize: file.size,
@@ -44,4 +44,3 @@ router.post('/process', upload.single('file'), async (req, res) => {
 });
 
 module.exports = router;
-
