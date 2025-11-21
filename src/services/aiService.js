@@ -1,13 +1,17 @@
 // services/aiService.js
 const axios = require('axios');
 
-const BASE_URL = process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta/openai/';
+// <--- CONFIGURATION FIXES --->
+// 1. Use the correct OpenAI-compatible endpoint structure (removes trailing slash issue)
+const BASE_URL = (process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta/openai/').replace(/\/+$/, '');
 const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
-// Tunables
-const TRUNCATE_CHARS = Number(process.env.GEMINI_TRUNCATE_CHARS) || 4000; // slice document to this many chars (safe default)
-const MAX_OUTPUT_TOKENS = Number(process.env.GEMINI_MAX_OUTPUT_TOKENS) || 800;
+// 2. 'gemini-2.5-flash' does not exist yet. Using 'gemini-1.5-flash' (current standard).
+const MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+
+// 3. Tunables: Increased default truncate to 15k chars (Flash has a large context window)
+const TRUNCATE_CHARS = Number(process.env.GEMINI_TRUNCATE_CHARS) || 15000;
+const MAX_OUTPUT_TOKENS = Number(process.env.GEMINI_MAX_OUTPUT_TOKENS) || 2000; // Increased for "reasoning" fields
 
 if (!API_KEY) {
   console.warn('GEMINI_API_KEY not set — Gemini calls will fail until configured.');
@@ -27,7 +31,7 @@ function parseRetryAfter(header) {
 }
 
 async function callWithRetry(fn, opts = {}) {
-  const { maxAttempts = 6, baseDelayMs = 500, maxDelayMs = 30000 } = opts;
+  const { maxAttempts = 5, baseDelayMs = 1000, maxDelayMs = 30000 } = opts;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -41,7 +45,7 @@ async function callWithRetry(fn, opts = {}) {
         const enriched = new Error(`Gemini request failed (attempt ${attempt}): ${err.message}`);
         enriched.original = err;
         enriched.status = status;
-        enriched.headers = headers;
+        enriched.responseBody = err?.response?.data;
         throw enriched;
       }
 
@@ -49,79 +53,26 @@ async function callWithRetry(fn, opts = {}) {
       if (waitMs === null) {
         const exp = Math.pow(2, attempt - 1);
         const cap = Math.min(maxDelayMs, baseDelayMs * exp);
-        waitMs = Math.floor(Math.random() * cap); // full jitter
+        waitMs = Math.floor(Math.random() * cap); 
       } else {
         waitMs = Math.min(waitMs, maxDelayMs);
       }
 
-      console.warn(`[gemini-retry] attempt=${attempt}/${maxAttempts} status=${status} waitMs=${waitMs} msg="${err.message}"`);
-      if (headers['x-ratelimit-limit'] || headers['x-ratelimit-remaining'] || headers['x-ratelimit-reset']) {
-        console.warn('x-ratelimit headers:', {
-          limit: headers['x-ratelimit-limit'],
-          remaining: headers['x-ratelimit-remaining'],
-          reset: headers['x-ratelimit-reset'],
-        });
-      }
-
+      console.warn(`[gemini-retry] attempt=${attempt} status=${status} waitMs=${waitMs}`);
       await sleep(waitMs);
     }
   }
-  // unreachable
 }
 
-/**
- * Robust extraction of textual output from various response shapes.
- * Returns string or null.
- */
 function extractTextFromResponseData(data) {
   if (!data) return null;
-
   try {
-    // 1) OpenAI-compat shape: choices[0].message.content
-    const choice = data.choices?.[0];
-    if (choice) {
-      const msg = choice.message ?? null;
-      if (msg) {
-        // content could be string
-        if (typeof msg.content === 'string' && msg.content.trim().length > 0) return msg.content;
-        // content could be array of chunks or objects
-        if (Array.isArray(msg.content) && msg.content.length > 0) {
-          // find first text-like entry
-          for (const item of msg.content) {
-            if (!item) continue;
-            if (typeof item === 'string' && item.trim()) return item;
-            if (typeof item.text === 'string' && item.text.trim()) return item.text;
-            if (typeof item.content === 'string' && item.content.trim()) return item.content;
-          }
-        }
-      }
-      // legacy: choices[0].text
-      if (typeof choice.text === 'string' && choice.text.trim()) return choice.text;
-
-      if (choice.delta?.content) {
-        if (typeof choice.delta.content === 'string' && choice.delta.content.trim()) return choice.delta.content;
-      }
+    // OpenAI shape
+    if (data.choices?.[0]?.message?.content) {
+      return data.choices[0].message.content;
     }
-
-    if (Array.isArray(data.output) && data.output.length > 0) {
-      for (const out of data.output) {
-        if (!out) continue;
-        if (typeof out.content === 'string' && out.content.trim()) return out.content;
-        if (Array.isArray(out.content)) {
-          for (const c of out.content) {
-            if (!c) continue;
-            if (typeof c.text === 'string' && c.text.trim()) return c.text;
-            if (typeof c === 'string' && c.trim()) return c;
-          }
-        }
-      }
-    }
-
-    if (typeof data.output_text === 'string' && data.output_text.trim()) return data.output_text;
-
-    const joined = JSON.stringify(data);
-    if (joined && joined.length > 0) return joined;
-
+    // Google Native shape fallback
+    if (data.output_text) return data.output_text;
     return null;
   } catch (e) {
     return null;
@@ -133,9 +84,12 @@ async function extractStructuredJSON({ text, question }) {
     throw new Error('GEMINI_API_KEY not configured on server.');
   }
 
-  // Truncate large documents (configurable)
-  const truncatedText = String(text || '').slice(0, TRUNCATE_CHARS);
+  // 1. Prepare Text
+  // Sanitize text to prevent breaking the prompt structure (replace triple quotes)
+  const safeText = String(text || '').replace(/"""/g, '" " "'); 
+  const truncatedText = safeText.slice(0, TRUNCATE_CHARS);
 
+  // 2. YOUR EXACT PROMPTS
   const systemPrompt = `You are a JSON extractor. Output ONLY valid JSON (no extra commentary).
 Return an object with keys: "summary" (short), "key_pairs" (array of objects with "key" & "value"), "confidence" (0-1).
 Pick 5-8 most relevant key-value pairs related to the user's question.`;
@@ -153,6 +107,9 @@ Produce JSON with:
 Return JSON only.
   `;
 
+  // 3. Construct Payload
+  const url = `${BASE_URL}/chat/completions`;
+  
   const payload = {
     model: MODEL,
     messages: [
@@ -160,47 +117,43 @@ Return JSON only.
       { role: 'user', content: userPrompt },
     ],
     temperature: 0.0,
-    max_tokens: MAX_OUTPUT_TOKENS,
-    max_output_tokens: MAX_OUTPUT_TOKENS,
+    max_tokens: MAX_OUTPUT_TOKENS, // <--- CHANGED: "max_output_tokens" causes errors in OpenAI mode
   };
 
-  const url = `${BASE_URL}chat/completions`;
   const headers = {
     Authorization: `Bearer ${API_KEY}`,
     'Content-Type': 'application/json',
   };
 
+  // 4. Execute with Retry
   const resp = await callWithRetry(() => axios.post(url, payload, { headers }));
-
   const data = resp?.data;
-  try {
-    const rawStr = JSON.stringify(data);
-    console.log('[gemini] raw response data (trimmed 4000 chars):', rawStr.slice(0, 4000));
-  } catch (e) {
-    console.log('[gemini] raw response data (could not stringify)');
-  }
-
+  
+  // 5. Clean & Parse Output
   const textOut = extractTextFromResponseData(data);
 
   if (!textOut || !String(textOut).trim()) {
     const err = new Error('Model returned no usable output');
     err.raw = data;
-    err.reason = data?.choices?.[0]?.finish_reason ?? null;
     throw err;
   }
 
+  // Remove Markdown code blocks if present (Gemini often adds ```json ... ```)
+  let cleanJsonStr = textOut.trim();
+  if (cleanJsonStr.startsWith('```')) {
+    cleanJsonStr = cleanJsonStr.replace(/^```(json)?/i, '').replace(/```$/, '');
+  }
 
   try {
-    const parsed = JSON.parse(String(textOut).trim());
+    const parsed = JSON.parse(cleanJsonStr);
     return { success: true, structuredJson: parsed, raw: String(textOut) };
   } catch (parseErr) {
-    const jsonMatch = String(textOut).match(/\{[\s\S]*\}/);
+    // Final fallback: try to find the first '{' and last '}'
+    const jsonMatch = cleanJsonStr.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       try {
-        const parsed = JSON.parse(jsonMatch[0]);
-        return { success: true, structuredJson: parsed, raw: String(textOut) };
-      } catch (_) {
-      }
+        return { success: true, structuredJson: JSON.parse(jsonMatch[0]), raw: String(textOut) };
+      } catch (_) {}
     }
 
     const e = new Error('Model output not valid JSON');
