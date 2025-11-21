@@ -43,4 +43,44 @@ router.post('/process', upload.single('file'), async (req, res) => {
   }
 });
 
+// add to upload.js (or routes/sendWebhook.js mounted under /api)
+router.post('/send-webhook', async (req, res) => {
+  try {
+    const { recipientEmail, subject, body, text, structuredJson, question, metadata } = req.body || {};
+
+    if (!recipientEmail) {
+      return res.status(400).json({ error: true, message: 'recipientEmail required' });
+    }
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(recipientEmail)) {
+      return res.status(400).json({ error: true, message: 'invalid recipientEmail' });
+    }
+
+    const payload = {
+      filename: metadata?.filename || null,
+      fileSize: metadata?.fileSize || null,
+      aiOutput: structuredJson || null,
+      textSnippet: (text || '').slice(0, 2000),
+      userQuestion: question || null,
+      recipientEmail,
+      subject: subject || 'Document summary',
+      body: body || '',
+      metadata: metadata || {},
+    };
+
+    // Delegate to your n8nService; it will throw if it fails (recommended)
+    const result = await require('../services/n8nService').sendToN8N(payload);
+
+    return res.json({ success: true, n8n: result });
+  } catch (err) {
+    console.error('POST /api/send-webhook error:', err && (err.stack || err));
+    const upstream = err?.responseBody || err?.response?.data || undefined;
+    return res.status(err?.status || 500).json({
+      error: true,
+      message: err?.message || 'internal server error',
+      ...(upstream ? { upstream } : {}),
+    });
+  }
+});
+
+
 module.exports = router;
