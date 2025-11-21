@@ -1,24 +1,16 @@
-
+// services/aiService.js
 const axios = require('axios');
-
-/**
- * Minimal Gemini via OpenAI-compat wrapper using axios.
- *
- * Behaviour:
- * - Uses callWithRetry to handle 429/5xx/network errors (exponential backoff + jitter)
- * - Posts to Google OpenAI-compat chat/completions endpoint
- * - Tries to parse model output to JSON (multiple response-shape fallbacks)
- * - Returns { success: true, structuredJson, raw } on success or throws enriched Error
- *
- * Usage: await extractStructuredJSON({ text, question })
- */
 
 const BASE_URL = process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta/openai/';
 const API_KEY = process.env.GEMINI_API_KEY;
 const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
+// Tunables
+const TRUNCATE_CHARS = Number(process.env.GEMINI_TRUNCATE_CHARS) || 4000; // slice document to this many chars (safe default)
+const MAX_OUTPUT_TOKENS = Number(process.env.GEMINI_MAX_OUTPUT_TOKENS) || 800;
+
 if (!API_KEY) {
-  console.warn('GEMINI_API_KEY is not set. Set it to use Gemini via OpenAI-compat.');
+  console.warn('GEMINI_API_KEY not set — Gemini calls will fail until configured.');
 }
 
 function sleep(ms) {
@@ -78,50 +70,71 @@ async function callWithRetry(fn, opts = {}) {
 }
 
 /**
- * Try to extract a string reply from multiple possible response shapes.
+ * Robust extraction of textual output from various response shapes.
+ * Returns string or null.
  */
 function extractTextFromResponseData(data) {
-  // common OpenAI-compatible shapes
+  if (!data) return null;
+
   try {
-    // choices[0].message.content (could be string or object)
-    const choice = data?.choices?.[0];
+    // 1) OpenAI-compat shape: choices[0].message.content
+    const choice = data.choices?.[0];
     if (choice) {
-      // Try several possible locations
-      const msg = choice.message ?? choice;
-      // message could be { content: "..." } or { content: [{ type: 'output_text', text: '...' }] }
-      if (typeof msg === 'string') return msg;
-      if (msg?.content) {
-        if (typeof msg.content === 'string') return msg.content;
-        // content could be array of objects
-        if (Array.isArray(msg.content)) {
-          // try find string in items
-          const joined = msg.content.map(c => (typeof c === 'string' ? c : (c?.text ?? JSON.stringify(c)))).join(' ');
-          return joined;
+      const msg = choice.message ?? null;
+      if (msg) {
+        // content could be string
+        if (typeof msg.content === 'string' && msg.content.trim().length > 0) return msg.content;
+        // content could be array of chunks or objects
+        if (Array.isArray(msg.content) && msg.content.length > 0) {
+          // find first text-like entry
+          for (const item of msg.content) {
+            if (!item) continue;
+            if (typeof item === 'string' && item.trim()) return item;
+            if (typeof item.text === 'string' && item.text.trim()) return item.text;
+            if (typeof item.content === 'string' && item.content.trim()) return item.content;
+          }
+        }
+      }
+      // legacy: choices[0].text
+      if (typeof choice.text === 'string' && choice.text.trim()) return choice.text;
+
+      if (choice.delta?.content) {
+        if (typeof choice.delta.content === 'string' && choice.delta.content.trim()) return choice.delta.content;
+      }
+    }
+
+    if (Array.isArray(data.output) && data.output.length > 0) {
+      for (const out of data.output) {
+        if (!out) continue;
+        if (typeof out.content === 'string' && out.content.trim()) return out.content;
+        if (Array.isArray(out.content)) {
+          for (const c of out.content) {
+            if (!c) continue;
+            if (typeof c.text === 'string' && c.text.trim()) return c.text;
+            if (typeof c === 'string' && c.trim()) return c;
+          }
         }
       }
     }
 
-    // fallback: choices[0].text
-    if (choice?.text) return choice.text;
+    if (typeof data.output_text === 'string' && data.output_text.trim()) return data.output_text;
 
-    // another fallback: data.output_text or data.choices[0].delta?.content etc.
-    if (data?.output_text) return data.output_text;
-    if (choice?.delta?.content) return choice.delta.content;
+    const joined = JSON.stringify(data);
+    if (joined && joined.length > 0) return joined;
 
-    // last resort: stringify whole thing
-    return JSON.stringify(data);
+    return null;
   } catch (e) {
-    return String(data);
+    return null;
   }
 }
 
-/**
- * Main exported function
- */
 async function extractStructuredJSON({ text, question }) {
   if (!API_KEY) {
     throw new Error('GEMINI_API_KEY not configured on server.');
   }
+
+  // Truncate large documents (configurable)
+  const truncatedText = String(text || '').slice(0, TRUNCATE_CHARS);
 
   const systemPrompt = `You are a JSON extractor. Output ONLY valid JSON (no extra commentary).
 Return an object with keys: "summary" (short), "key_pairs" (array of objects with "key" & "value"), "confidence" (0-1).
@@ -129,8 +142,8 @@ Pick 5-8 most relevant key-value pairs related to the user's question.`;
 
   const userPrompt = `
 Document Text:
-"""${String(text).slice(0, 15000)}"""
-User question: "${String(question).replace(/"/g, '\\"')}"
+"""${truncatedText}"""
+User question: "${String(question || '').replace(/"/g, '\\"')}"
 
 Produce JSON with:
 - summary: 1-2 line analysis relevant to the question
@@ -147,39 +160,50 @@ Return JSON only.
       { role: 'user', content: userPrompt },
     ],
     temperature: 0.0,
-    max_tokens: 800,
+    max_tokens: MAX_OUTPUT_TOKENS,
+    max_output_tokens: MAX_OUTPUT_TOKENS,
   };
 
   const url = `${BASE_URL}chat/completions`;
   const headers = {
-    'Authorization': `Bearer ${API_KEY}`,
+    Authorization: `Bearer ${API_KEY}`,
     'Content-Type': 'application/json',
   };
 
   const resp = await callWithRetry(() => axios.post(url, payload, { headers }));
 
   const data = resp?.data;
-  console.log('[gemini] raw response data (first 2k chars):', JSON.stringify(data).slice(0, 2000));
+  try {
+    const rawStr = JSON.stringify(data);
+    console.log('[gemini] raw response data (trimmed 4000 chars):', rawStr.slice(0, 4000));
+  } catch (e) {
+    console.log('[gemini] raw response data (could not stringify)');
+  }
 
   const textOut = extractTextFromResponseData(data);
 
-  // try parse JSON in a safe way
+  if (!textOut || !String(textOut).trim()) {
+    const err = new Error('Model returned no usable output');
+    err.raw = data;
+    err.reason = data?.choices?.[0]?.finish_reason ?? null;
+    throw err;
+  }
+
+
   try {
-    const parsed = JSON.parse(textOut);
-    return { success: true, structuredJson: parsed, raw: textOut };
+    const parsed = JSON.parse(String(textOut).trim());
+    return { success: true, structuredJson: parsed, raw: String(textOut) };
   } catch (parseErr) {
-    // If parsing fails, try to extract JSON substring (best-effort)
-    const jsonMatch = textOut.match(/\{[\s\S]*\}/);
+    const jsonMatch = String(textOut).match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       try {
         const parsed = JSON.parse(jsonMatch[0]);
-        return { success: true, structuredJson: parsed, raw: textOut };
+        return { success: true, structuredJson: parsed, raw: String(textOut) };
       } catch (_) {
-        // fall through
       }
     }
-    // final: throw enriched error so caller falls back
-    const e = new Error('Model returned non-JSON content');
+
+    const e = new Error('Model output not valid JSON');
     e.raw = textOut;
     e.parseError = parseErr.message;
     throw e;
